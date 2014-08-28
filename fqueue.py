@@ -64,17 +64,20 @@ def lock(fd, timeout=None):
 
 class FileQueue(object):
     STOPPED = False
-    bucket_size = 1024 * 1024  # 1MB
+    bucket_size = 20  # 1MB
 
     def __init__(self, name=None, log=None):
         self.name = name
         self.logger = log or logger
 
-        semname = base64.urlsafe_b64encode(hashlib.md5(self.name.encode('ascii')).digest())
-        self.sem = Semaphore(b'/' + semname, O_CREAT, initial_value=1)
+        semname = b'/' + base64.urlsafe_b64encode(hashlib.md5(self.name.encode('ascii')).digest())
+        self.sem = Semaphore(semname, O_CREAT, initial_value=1)
 
         fnamepos = "%s.pos" % self.name
         if not os.path.exists(fnamepos):
+            self.sem.unlink()
+            self.sem.close()
+            self.sem = Semaphore(semname, O_CREAT, initial_value=1)
             open(fnamepos, 'wb').close()  # touch file
         self.fpos = open(fnamepos, 'r+b')
 
