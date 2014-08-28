@@ -1,4 +1,4 @@
-from __future__ import absolute_import, unicode_literals
+from __future__ import absolute_import, unicode_literals, print_function
 
 import os
 import sys
@@ -63,60 +63,115 @@ def lock(fd, timeout=None):
 
 class FileQueue(object):
     STOPPED = False
+    bucket_size = 1024 * 1024  # 1MB
 
     def __init__(self, name=None, log=None):
         self.name = name
         self.logger = log or logger
 
-        self.fnum = 0
-        fname = '%s.%s' % (self.name, self.fnum)
+        self.sem = Semaphore(b'%s-FileQueue.sem' % self.name.encode('ascii'), O_CREAT, initial_value=1)
+
         fnamepos = "%s.pos" % self.name
         if not os.path.exists(fnamepos):
             open(fnamepos, 'wb').close()  # touch file
         self.fpos = open(fnamepos, 'r+b')
-        self.fwrite = open(fname, 'ab')
+
+        self.fread = None
+        self.frnum = None
+
+        self.fwrite = None
+        self.fwnum = None
+
+        with lock(self.fpos, 3) as fpos:
+            fpos.seek(0)
+            try:
+                frnum, _ = marshal.load(fpos)
+            except (EOFError, ValueError, TypeError):
+                frnum = 0  # New, perhaps empty or corrupt pos file
+        self._open_write(frnum)
+
+    def _cleanup(self, fnum):
+        """
+        Deletes all files for the queue up to, and including, fnum.
+
+        """
+        while os.path.exists('%s.%s' % (self.name, fnum)):
+            try:
+                fname = '%s.%s' % (self.name, fnum)
+                os.unlink(fname)
+                # print('cleaned up file:', fname, file=sys.stderr)
+            except:
+                pass
+            fnum -= 1
+
+    def _open_read(self, frnum):
+        if self.frnum == frnum:
+            return
+        if self.fread:
+            self.fread.close()
+        fname = '%s.%s' % (self.name, frnum)
+        if not os.path.exists(fname):
+            open(fname, 'wb').close()  # touch file
         self.fread = open(fname, 'rb')
-        self.sem = Semaphore(b'%s-FileQueue.sem' % self.name.encode('ascii'), O_CREAT, initial_value=1)
+        self.frnum = frnum
+        # print('new read bucket:', self.frnum, file=sys.stderr)
+
+    def _open_write(self, fwnum):
+        _fwnum = fwnum
+        while os.path.exists('%s.%s' % (self.name, _fwnum)):
+            fwnum = _fwnum
+            _fwnum += 1
+        if self.fwnum == fwnum:
+            return
+        if self.fwrite:
+            self.fwrite.close()
+        self.fwrite = open('%s.%s' % (self.name, fwnum), 'ab')
+        self.fwnum = fwnum
+        # print('new write bucket:', self.fwnum, file=sys.stderr)
 
     def __del__(self):
-        self.fpos.close()
-        self.fwrite.close()
-        self.fread.close()
+        if self.fpos:
+            self.fpos.close()
+        if self.fwrite:
+            self.fwrite.close()
+        if self.fread:
+            self.fread.close()
 
     def get(self, block=True, timeout=None):
         while True:
             try:
-                print >>sys.stderr, 'aquire',
+                # Try acquiring the semaphore (in case there's something to read)
                 self.sem.acquire(block and timeout or None)
-                print >>sys.stderr, '!'
             except BusyError:
                 raise Queue.Empty
             try:
                 with lock(self.fpos, 3) as fpos:
                     fpos.seek(0)
                     try:
-                        num, offset = marshal.load(fpos)
-                    except (EOFError, ValueError, TypeError) as e:
-                        num = offset = 0
-                        print >>sys.stderr, 'POS ERROR:', e
-                    print >>sys.stderr, '@', (num, offset)
+                        frnum, offset = marshal.load(fpos)
+                    except (EOFError, ValueError, TypeError):
+                        frnum = offset = 0  # New, perhaps empty or corrupt pos file
+                    # print('@', (frnum, offset), file=sys.stderr)
+                    self._open_read(frnum)
                     self.fread.seek(offset)
                     try:
                         value = marshal.load(self.fread)
                         offset = self.fread.tell()
+                        if offset > self.bucket_size:
+                            self._cleanup(frnum - 1)
+                            self._open_read(frnum + 1)
+                            offset = 0
                         peek = self.fread.read(1)
-                        print >>sys.stderr, 'peek', repr(peek)
-                        if len(peek) != 1:
-                            print >>sys.stderr, 'release (1)',
+                        if len(peek):
+                            # If there's something further in the file, release
+                            # the semaphore. FIXME: There are two releases, which is wrong!
                             self.sem.release()
-                            print >>sys.stderr, '!'
                         return value
-                    except (EOFError, ValueError, TypeError) as e:
-                        print >>sys.stderr, 'FILE ERROR:', e
-                        pass
+                    except (EOFError, ValueError, TypeError):
+                        pass  # The file could not be read, ignore
                     finally:
                         fpos.seek(0)
-                        marshal.dump((self.fnum, offset), fpos)
+                        marshal.dump((self.frnum, offset), fpos)
                         fpos.flush()
             except TimeoutError:
                 raise Queue.Empty
@@ -126,9 +181,10 @@ class FileQueue(object):
             with lock(self.fwrite, 3) as fwrite:
                 marshal.dump(value, fwrite)
                 fwrite.flush()
-            print >>sys.stderr, 'release (2)',
+                offset = fwrite.tell()
+            if offset > self.bucket_size:
+                self._open_write(self.fwnum + 1)
             self.sem.release()
-            print >>sys.stderr, '!'
         except TimeoutError:
             raise Queue.Full
 
