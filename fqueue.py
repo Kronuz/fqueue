@@ -64,7 +64,7 @@ def lock(fd, timeout=None):
 
 class FileQueue(object):
     STOPPED = False
-    bucket_size = 20  # 1MB
+    bucket_size = 20  # 1024 * 1024 = 1MB
 
     def __init__(self, name=None, log=None):
         self.name = name
