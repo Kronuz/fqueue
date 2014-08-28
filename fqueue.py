@@ -1,7 +1,8 @@
 from __future__ import absolute_import, unicode_literals, print_function
 
 import os
-import sys
+import base64
+import hashlib
 
 import fcntl
 import errno
@@ -69,7 +70,8 @@ class FileQueue(object):
         self.name = name
         self.logger = log or logger
 
-        self.sem = Semaphore(b'%s-FileQueue.sem' % self.name.encode('ascii'), O_CREAT, initial_value=1)
+        semname = base64.urlsafe_b64encode(hashlib.md5(self.name.encode('ascii')).digest())
+        self.sem = Semaphore(b'/' + semname, O_CREAT, initial_value=1)
 
         fnamepos = "%s.pos" % self.name
         if not os.path.exists(fnamepos):
