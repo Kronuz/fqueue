@@ -166,11 +166,11 @@ class FileQueue(object):
                             self._cleanup(frnum - 1)
                             self._open_read(frnum + 1)
                             offset = 0
-                        peek = self.fread.read(1)
-                        if len(peek):
-                            # If there's something further in the file, release
-                            # the semaphore. FIXME: There are two releases, which is wrong!
-                            self.sem.release()
+                        # peek = self.fread.read(1)
+                        # if len(peek):
+                        #     # If there's something further in the file, release
+                        #     # the semaphore. FIXME: There are two releases, which is wrong!
+                        #     self.sem.release()
                         return value
                     except (EOFError, ValueError, TypeError):
                         pass  # The file could not be read, ignore
