@@ -132,8 +132,8 @@ class FileQueue(object):
         # print('new write bucket:', self.fwnum, file=sys.stderr)
 
     def __del__(self):
-        if self.fpos:
-            self.fpos.close()
+        self.fpos.close()
+        self.sem.close()
         if self.fwrite:
             self.fwrite.close()
         if self.fread:
