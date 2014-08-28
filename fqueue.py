@@ -86,7 +86,9 @@ class FileQueue(object):
     def get(self, block=True, timeout=None):
         while True:
             try:
+                print >>sys.stderr, 'aquire',
                 self.sem.acquire(block and timeout or None)
+                print >>sys.stderr, '!'
             except BusyError:
                 raise Queue.Empty
             try:
@@ -94,18 +96,27 @@ class FileQueue(object):
                     fpos.seek(0)
                     try:
                         num, offset = marshal.load(fpos)
-                    except (EOFError, ValueError, TypeError):
+                    except (EOFError, ValueError, TypeError) as e:
                         num = offset = 0
+                        print >>sys.stderr, 'POS ERROR:', e
+                    print >>sys.stderr, '@', (num, offset)
                     self.fread.seek(offset)
                     try:
-                        return marshal.load(self.fread)
-                    except (EOFError, ValueError, TypeError):
+                        value = marshal.load(self.fread)
+                        offset = self.fread.tell()
+                        peek = self.fread.read(1)
+                        print >>sys.stderr, 'peek', repr(peek)
+                        if len(peek) != 1:
+                            print >>sys.stderr, 'release (1)',
+                            self.sem.release()
+                            print >>sys.stderr, '!'
+                        return value
+                    except (EOFError, ValueError, TypeError) as e:
+                        print >>sys.stderr, 'FILE ERROR:', e
                         pass
                     finally:
-                        if len(self.fread.read(1)) != 1:
-                            self.sem.release()
                         fpos.seek(0)
-                        marshal.dump((self.fnum, self.fread.tell()), fpos)
+                        marshal.dump((self.fnum, offset), fpos)
                         fpos.flush()
             except TimeoutError:
                 raise Queue.Empty
@@ -115,15 +126,17 @@ class FileQueue(object):
             with lock(self.fwrite, 3) as fwrite:
                 marshal.dump(value, fwrite)
                 fwrite.flush()
+            print >>sys.stderr, 'release (2)',
             self.sem.release()
+            print >>sys.stderr, '!'
         except TimeoutError:
             raise Queue.Full
 
 
-def main(argv):
-    queue = FileQueue('/tmp/testing')
-    queue.put('TEST')
-    queue.get()
+# def main(argv):
+#     queue = FileQueue('/tmp/testing')
+#     queue.put('TEST')
+#     queue.get()
 
-if __name__ == '__main__':
-    main(sys.argv)
+# if __name__ == '__main__':
+#     main(sys.argv)
