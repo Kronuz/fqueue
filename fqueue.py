@@ -1,6 +1,7 @@
 from __future__ import absolute_import, unicode_literals, print_function
 
 import os
+import time
 
 import fcntl
 from contextlib import contextmanager
@@ -22,6 +23,29 @@ def flock(fd):
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
+def acquire(sem, timeout=None):
+    start = time.time()
+    block = sem.block
+    if timeout is None:
+        sleep = 0
+        sem.block = True
+    else:
+        sleep = min(max(timeout / 5.0, 0.5), 2.0)
+        sem.block = sysv_ipc.SEMAPHORE_TIMEOUT_SUPPORTED
+    try:
+        while not timeout or time.time() - start < timeout:
+            try:
+                return sem.acquire(timeout)
+            except sysv_ipc.BusyError:
+                if not timeout or sem.block:
+                    raise
+            _sleep = min(max(0, timeout - time.time() + start), sleep)
+            time.sleep(_sleep)
+        raise sysv_ipc.BusyError
+    finally:
+        sem.block = block
+
+
 class FileQueue(object):
     STOPPED = False
 
@@ -38,9 +62,9 @@ class FileQueue(object):
         self.lock = sysv_ipc.Semaphore(hash(b'%s.lock' % semname), sysv_ipc.IPC_CREAT, initial_value=1)
         self.spos = sysv_ipc.SharedMemory(hash(b'%s.spos' % semname), sysv_ipc.IPC_CREAT, size=self.shm_size)
 
-        # log.debug("%s.sem = %s" % (semname, hex(self.sem.key & 0xffffffff)[:-1]))
-        # log.debug("%s.lock = %s" % (semname, hex(self.lock.key & 0xffffffff)[:-1]))
-        # log.debug("%s.spos = %s" % (semname, hex(self.spos.key & 0xffffffff)[:-1]))
+        # self.log.debug("%s.sem = %s", semname, hex(self.sem.key & 0xffffffff)[:-1])
+        # self.log.debug("%s.lock = %s", semname, hex(self.lock.key & 0xffffffff)[:-1])
+        # self.log.debug("%s.spos = %s", semname, hex(self.spos.key & 0xffffffff)[:-1])
 
         fnamepos = '%s.pos' % self.name
         if not os.path.exists(fnamepos):
@@ -81,7 +105,7 @@ class FileQueue(object):
             try:
                 fname = '%s.%s' % (self.name, fnum)
                 os.unlink(fname)
-                self.log.debug("Cleaned up file:", fname)
+                # self.log.debug("Cleaned up file: %s", fname)
             except:
                 pass
             fnum -= 1
@@ -96,7 +120,7 @@ class FileQueue(object):
             open(fname, 'wb').close()  # touch file
         self.fread = open(fname, 'rb')
         self.frnum = frnum
-        self.log.debug("New read bucket:", self.frnum)
+        # self.log.debug("New read bucket: %s", self.frnum)
 
     def _open_write(self, fwnum):
         _fwnum = fwnum
@@ -109,7 +133,7 @@ class FileQueue(object):
             self.fwrite.close()
         self.fwrite = open('%s.%s' % (self.name, fwnum), 'ab')
         self.fwnum = fwnum
-        self.log.debug("New write bucket:", self.fwnum)
+        # self.log.debug("New write bucket: %s", self.fwnum)
 
     def __del__(self):
         self.fpos.close()
@@ -122,11 +146,11 @@ class FileQueue(object):
         while True:
             try:
                 # Try acquiring the semaphore (in case there's something to read)
-                self.sem.acquire(block and timeout or 0)
+                acquire(self.sem, block and timeout or 0)
             except sysv_ipc.BusyError:
                 raise Queue.Empty
             try:
-                self.lock.acquire(5)
+                acquire(self.lock, 5)
             except sysv_ipc.BusyError:
                 if self.STOPPED:
                     raise Queue.Empty
@@ -139,7 +163,7 @@ class FileQueue(object):
                     # New, perhaps empty or corrupt pos file
                     frnum, offset = self._update_pos()
                     age = 0
-                self.log.debug('@ %s' % repr((frnum, offset, age)))
+                # self.log.debug('@ %s' % repr((frnum, offset, age)))
 
                 # Open proper queue file for reading (if it isn't open yet):
                 self._open_read(frnum)
