@@ -5,6 +5,7 @@ import time
 
 import fcntl
 from contextlib import contextmanager
+import posix_ipc
 import sysv_ipc
 
 import Queue
@@ -14,6 +15,50 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+# Try to use a semaphore that supports timeout natively
+if sysv_ipc.SEMAPHORE_TIMEOUT_SUPPORTED or posix_ipc.SEMAPHORE_TIMEOUT_SUPPORTED:
+    if sysv_ipc.SEMAPHORE_TIMEOUT_SUPPORTED:
+        IPC_CREAT = sysv_ipc.IPC_CREAT
+        BusyError = sysv_ipc.BusyError
+        Semaphore = sysv_ipc.Semaphore
+        sem_hash = hash
+    else:
+        IPC_CREAT = posix_ipc.O_CREAT
+        BusyError = posix_ipc.BusyError
+        Semaphore = posix_ipc.Semaphore
+        sem_hash = lambda x: b'/%s%s' % (hash(x) & 0xffffffff, hash(x) >> 32 & 0xffffffff)
+
+    def acquire(sem, timeout=None):
+        return sem.acquire(timeout)
+else:
+    IPC_CREAT = sysv_ipc.IPC_CREAT
+    BusyError = sysv_ipc.BusyError
+    Semaphore = sysv_ipc.Semaphore
+    sem_hash = hash
+
+    def acquire(sem, timeout=None):
+        start = time.time()
+        block = sem.block
+        if timeout is None:
+            sleep = 0
+            sem.block = True
+        else:
+            sleep = min(max(timeout / 5.0, 0.5), 2.0)
+            sem.block = False
+        try:
+            while not timeout or time.time() - start < timeout:
+                try:
+                    return sem.acquire(timeout)
+                except BusyError:
+                    if not timeout or sem.block:
+                        raise
+                _sleep = min(max(0, timeout - time.time() + start), sleep)
+                time.sleep(_sleep)
+            raise BusyError
+        finally:
+            sem.block = block
+
+
 @contextmanager
 def flock(fd):
     fcntl.flock(fd, fcntl.LOCK_EX)
@@ -21,29 +66,6 @@ def flock(fd):
         yield fd
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
-
-
-def acquire(sem, timeout=None):
-    start = time.time()
-    block = sem.block
-    if timeout is None:
-        sleep = 0
-        sem.block = True
-    else:
-        sleep = min(max(timeout / 5.0, 0.5), 2.0)
-        sem.block = sysv_ipc.SEMAPHORE_TIMEOUT_SUPPORTED
-    try:
-        while not timeout or time.time() - start < timeout:
-            try:
-                return sem.acquire(timeout)
-            except sysv_ipc.BusyError:
-                if not timeout or sem.block:
-                    raise
-            _sleep = min(max(0, timeout - time.time() + start), sleep)
-            time.sleep(_sleep)
-        raise sysv_ipc.BusyError
-    finally:
-        sem.block = block
 
 
 class FileQueue(object):
@@ -58,13 +80,9 @@ class FileQueue(object):
         self.log = log or logger
 
         semname = self.name
-        self.sem = sysv_ipc.Semaphore(hash(b'%s.sem' % semname), sysv_ipc.IPC_CREAT, initial_value=1)
-        self.lock = sysv_ipc.Semaphore(hash(b'%s.lock' % semname), sysv_ipc.IPC_CREAT, initial_value=1)
+        self.sem = Semaphore(sem_hash(b'%s.sem' % semname), IPC_CREAT, initial_value=1)
+        self.lock = Semaphore(sem_hash(b'%s.lock' % semname), IPC_CREAT, initial_value=1)
         self.spos = sysv_ipc.SharedMemory(hash(b'%s.spos' % semname), sysv_ipc.IPC_CREAT, size=self.shm_size)
-
-        # self.log.debug("%s.sem = %s", semname, hex(self.sem.key & 0xffffffff)[:-1])
-        # self.log.debug("%s.lock = %s", semname, hex(self.lock.key & 0xffffffff)[:-1])
-        # self.log.debug("%s.spos = %s", semname, hex(self.spos.key & 0xffffffff)[:-1])
 
         fnamepos = '%s.pos' % self.name
         if not os.path.exists(fnamepos):
@@ -147,11 +165,11 @@ class FileQueue(object):
             try:
                 # Try acquiring the semaphore (in case there's something to read)
                 acquire(self.sem, block and timeout or 0)
-            except sysv_ipc.BusyError:
+            except BusyError:
                 raise Queue.Empty
             try:
                 acquire(self.lock, 5)
-            except sysv_ipc.BusyError:
+            except BusyError:
                 if self.STOPPED:
                     raise Queue.Empty
                 raise
