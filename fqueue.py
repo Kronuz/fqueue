@@ -1,12 +1,10 @@
 from __future__ import absolute_import, unicode_literals, print_function
 
 import os
-import base64
-import hashlib
 
 import fcntl
 from contextlib import contextmanager
-from posix_ipc import Semaphore, O_CREAT, BusyError
+import sysv_ipc
 
 import Queue
 import marshal
@@ -26,22 +24,28 @@ def flock(fd):
 
 class FileQueue(object):
     STOPPED = False
-    CONNECTED = False
-    bucket_size = 20#1024 * 1024  # 1MB
+
+    shm_size = len(marshal.dumps((0, 0, 0)))
+    bucket_size = 100 * 1024#1024 * 1024  # 1MB
+    sync_age = 100
 
     def __init__(self, name=None, log=None):
         self.name = name
-        self.logger = log or logger
+        self.log = log or logger
 
-        semname = b'/' + base64.urlsafe_b64encode(hashlib.md5(self.name.encode('ascii')).digest())
-        self.sem = Semaphore(semname, O_CREAT, initial_value=1)
+        semname = self.name
+        self.sem = sysv_ipc.Semaphore(hash(b'%s.sem' % semname), sysv_ipc.IPC_CREAT, initial_value=1)
+        self.lock = sysv_ipc.Semaphore(hash(b'%s.lock' % semname), sysv_ipc.IPC_CREAT, initial_value=1)
+        self.spos = sysv_ipc.SharedMemory(hash(b'%s.spos' % semname), sysv_ipc.IPC_CREAT, size=self.shm_size)
 
-        fnamepos = "%s.pos" % self.name
+        # log.debug("%s.sem = %s" % (semname, hex(self.sem.key & 0xffffffff)[:-1]))
+        # log.debug("%s.lock = %s" % (semname, hex(self.lock.key & 0xffffffff)[:-1]))
+        # log.debug("%s.spos = %s" % (semname, hex(self.spos.key & 0xffffffff)[:-1]))
+
+        fnamepos = '%s.pos' % self.name
         if not os.path.exists(fnamepos):
-            self.sem.unlink()
-            self.sem.close()
-            self.sem = Semaphore(semname, O_CREAT, initial_value=1)
             open(fnamepos, 'wb').close()  # touch file
+            self.spos.write(b'\x00' * self.shm_size)  # clean memory
         self.fpos = open(fnamepos, 'r+b')
 
         self.fread = None
@@ -50,13 +54,23 @@ class FileQueue(object):
         self.fwrite = None
         self.fwnum = None
 
+        frnum, _ = self._update_pos()
+        self._open_write(frnum)
+
+    def _update_pos(self, fnum=None, offset=None):
         with flock(self.fpos) as fpos:
             fpos.seek(0)
             try:
-                frnum, _ = marshal.load(fpos)
+                _fnum, _offset = marshal.load(fpos)
             except (EOFError, ValueError, TypeError):
-                frnum = 0  # New, perhaps empty or corrupt pos file
-        self._open_write(frnum)
+                _fnum, _offset = 0, 0  # New, perhaps empty or corrupt pos file
+            finally:
+                if fnum is not None and offset is not None:
+                    fpos.seek(0)
+                    marshal.dump((fnum, offset), fpos)
+                    fpos.flush()
+                    os.fsync(fpos.fileno())
+        return _fnum, _offset
 
     def _cleanup(self, fnum):
         """
@@ -67,7 +81,7 @@ class FileQueue(object):
             try:
                 fname = '%s.%s' % (self.name, fnum)
                 os.unlink(fname)
-                # print('cleaned up file:', fname, file=sys.stderr)
+                self.log.debug("Cleaned up file:", fname)
             except:
                 pass
             fnum -= 1
@@ -82,7 +96,7 @@ class FileQueue(object):
             open(fname, 'wb').close()  # touch file
         self.fread = open(fname, 'rb')
         self.frnum = frnum
-        # print('new read bucket:', self.frnum, file=sys.stderr)
+        self.log.debug("New read bucket:", self.frnum)
 
     def _open_write(self, fwnum):
         _fwnum = fwnum
@@ -95,11 +109,10 @@ class FileQueue(object):
             self.fwrite.close()
         self.fwrite = open('%s.%s' % (self.name, fwnum), 'ab')
         self.fwnum = fwnum
-        # print('new write bucket:', self.fwnum, file=sys.stderr)
+        self.log.debug("New write bucket:", self.fwnum)
 
     def __del__(self):
         self.fpos.close()
-        self.sem.close()
         if self.fwrite:
             self.fwrite.close()
         if self.fread:
@@ -109,38 +122,55 @@ class FileQueue(object):
         while True:
             try:
                 # Try acquiring the semaphore (in case there's something to read)
-                self.sem.acquire(block and timeout or None)
-            except BusyError:
+                self.sem.acquire(block and timeout or 0)
+            except sysv_ipc.BusyError:
                 raise Queue.Empty
-            with flock(self.fpos) as fpos:
-                fpos.seek(0)
+            try:
+                self.lock.acquire(5)
+            except sysv_ipc.BusyError:
+                if self.STOPPED:
+                    raise Queue.Empty
+                raise
+            try:
+                # Get nest file/offset (from shared memory):
                 try:
-                    frnum, offset = marshal.load(fpos)
+                    frnum, offset, age = marshal.loads(self.spos.read())
                 except (EOFError, ValueError, TypeError):
-                    frnum = offset = 0  # New, perhaps empty or corrupt pos file
-                # print('@', (frnum, offset), file=sys.stderr)
+                    # New, perhaps empty or corrupt pos file
+                    frnum, offset = self._update_pos()
+                    age = 0
+                self.log.debug('@ %s' % repr((frnum, offset, age)))
+
+                # Open proper queue file for reading (if it isn't open yet):
                 self._open_read(frnum)
                 self.fread.seek(offset)
+
+                # Read from the queue
                 try:
                     value = marshal.load(self.fread)
                     offset = self.fread.tell()
                     if offset > self.bucket_size:
                         self._cleanup(frnum - 1)
                         self._open_read(frnum + 1)
+                        age = self.sync_age  # Force updateing position
                         offset = 0
-                    # peek = self.fread.read(1)
-                    # if len(peek):
-                    #     # If there's something further in the file, release
-                    #     # the semaphore. FIXME: There are two releases, which is wrong!
-                    #     self.sem.release()
+                    peek = self.fread.read(1)
+                    if len(peek):
+                        # If there's something more to read in the file,
+                        # release (or re-release) the semaphore.
+                        self.sem.release()
                     return value
                 except (EOFError, ValueError, TypeError):
                     pass  # The file could not be read, ignore
                 finally:
-                    fpos.seek(0)
-                    marshal.dump((self.frnum, offset), fpos)
-                    fpos.flush()
-                    os.fsync(fpos.fileno())
+                    # Update position
+                    if age >= self.sync_age:
+                        self._update_pos(self.frnum, offset)
+                        age = 0
+                    self.spos.write(marshal.dumps((self.frnum, offset, age + 1)))
+
+            finally:
+                self.lock.release()
 
     def put(self, value, block=True, timeout=None):
         with flock(self.fwrite) as fwrite:
@@ -149,6 +179,7 @@ class FileQueue(object):
             os.fsync(fwrite.fileno())
             offset = fwrite.tell()
         if offset > self.bucket_size:
+            # Switch to a new queue file:
             self._open_write(self.fwnum + 1)
         self.sem.release()
 
