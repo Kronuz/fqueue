@@ -5,8 +5,6 @@ import base64
 import hashlib
 
 import fcntl
-import errno
-import signal
 from contextlib import contextmanager
 from posix_ipc import Semaphore, O_CREAT, BusyError
 
@@ -17,54 +15,19 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-class TimeoutError(Exception):
-    pass
-
-
 @contextmanager
-def _timeout(seconds):
-    if seconds and seconds > 0:
-        def timeout_handler(signum, frame):
-            pass
-
-        original_handler = signal.signal(signal.SIGALRM, timeout_handler)
-
-        try:
-            signal.alarm(seconds)
-            yield
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, original_handler)
-    else:
-        yield
-
-
-def _acquire(fd, timeout):
-    with _timeout(timeout):
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        except IOError as e:
-            if e.errno != errno.EINTR:
-                raise e
-            raise TimeoutError
-
-
-def _release(fd):
-    fcntl.flock(fd, fcntl.LOCK_UN)
-
-
-@contextmanager
-def lock(fd, timeout=None):
-    _acquire(fd, timeout)
+def flock(fd):
+    fcntl.flock(fd, fcntl.LOCK_EX)
     try:
         yield fd
     finally:
-        _release(fd)
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 class FileQueue(object):
     STOPPED = False
-    bucket_size = 20  # 1024 * 1024 = 1MB
+    CONNECTED = False
+    bucket_size = 20#1024 * 1024  # 1MB
 
     def __init__(self, name=None, log=None):
         self.name = name
@@ -87,7 +50,7 @@ class FileQueue(object):
         self.fwrite = None
         self.fwnum = None
 
-        with lock(self.fpos, 3) as fpos:
+        with flock(self.fpos) as fpos:
             fpos.seek(0)
             try:
                 frnum, _ = marshal.load(fpos)
@@ -149,49 +112,45 @@ class FileQueue(object):
                 self.sem.acquire(block and timeout or None)
             except BusyError:
                 raise Queue.Empty
-            try:
-                with lock(self.fpos, 3) as fpos:
+            with flock(self.fpos) as fpos:
+                fpos.seek(0)
+                try:
+                    frnum, offset = marshal.load(fpos)
+                except (EOFError, ValueError, TypeError):
+                    frnum = offset = 0  # New, perhaps empty or corrupt pos file
+                # print('@', (frnum, offset), file=sys.stderr)
+                self._open_read(frnum)
+                self.fread.seek(offset)
+                try:
+                    value = marshal.load(self.fread)
+                    offset = self.fread.tell()
+                    if offset > self.bucket_size:
+                        self._cleanup(frnum - 1)
+                        self._open_read(frnum + 1)
+                        offset = 0
+                    # peek = self.fread.read(1)
+                    # if len(peek):
+                    #     # If there's something further in the file, release
+                    #     # the semaphore. FIXME: There are two releases, which is wrong!
+                    #     self.sem.release()
+                    return value
+                except (EOFError, ValueError, TypeError):
+                    pass  # The file could not be read, ignore
+                finally:
                     fpos.seek(0)
-                    try:
-                        frnum, offset = marshal.load(fpos)
-                    except (EOFError, ValueError, TypeError):
-                        frnum = offset = 0  # New, perhaps empty or corrupt pos file
-                    # print('@', (frnum, offset), file=sys.stderr)
-                    self._open_read(frnum)
-                    self.fread.seek(offset)
-                    try:
-                        value = marshal.load(self.fread)
-                        offset = self.fread.tell()
-                        if offset > self.bucket_size:
-                            self._cleanup(frnum - 1)
-                            self._open_read(frnum + 1)
-                            offset = 0
-                        # peek = self.fread.read(1)
-                        # if len(peek):
-                        #     # If there's something further in the file, release
-                        #     # the semaphore. FIXME: There are two releases, which is wrong!
-                        #     self.sem.release()
-                        return value
-                    except (EOFError, ValueError, TypeError):
-                        pass  # The file could not be read, ignore
-                    finally:
-                        fpos.seek(0)
-                        marshal.dump((self.frnum, offset), fpos)
-                        fpos.flush()
-            except TimeoutError:
-                raise Queue.Empty
+                    marshal.dump((self.frnum, offset), fpos)
+                    fpos.flush()
+                    os.fsync(fpos.fileno())
 
     def put(self, value, block=True, timeout=None):
-        try:
-            with lock(self.fwrite, 3) as fwrite:
-                marshal.dump(value, fwrite)
-                fwrite.flush()
-                offset = fwrite.tell()
-            if offset > self.bucket_size:
-                self._open_write(self.fwnum + 1)
-            self.sem.release()
-        except TimeoutError:
-            raise Queue.Full
+        with flock(self.fwrite) as fwrite:
+            marshal.dump(value, fwrite)
+            fwrite.flush()
+            os.fsync(fwrite.fileno())
+            offset = fwrite.tell()
+        if offset > self.bucket_size:
+            self._open_write(self.fwnum + 1)
+        self.sem.release()
 
 
 # def main(argv):
