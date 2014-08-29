@@ -72,8 +72,8 @@ class FileQueue(object):
     STOPPED = False
 
     shm_size = len(marshal.dumps((0, 0, 0)))
-    bucket_size = 100 * 1024#1024 * 1024  # 1MB
-    sync_age = 100
+    bucket_size = 10 * 1024 * 1024  # 10MB
+    sync_age = 500
 
     def __init__(self, name=None, log=None):
         self.name = name
