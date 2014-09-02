@@ -2,6 +2,7 @@ from __future__ import absolute_import, unicode_literals, print_function
 
 import os
 import time
+import zlib
 
 import fcntl
 from contextlib import contextmanager
@@ -86,8 +87,11 @@ class FileQueue(object):
 
         fnamepos = '%s.pos' % self.name
         if not os.path.exists(fnamepos):
-            open(fnamepos, 'wb').close()  # touch file
-            self.spos.write(b'\x00' * self.shm_size)  # clean memory
+            empty = marshal.dumps((0, 0, 0))
+            self.spos.write(empty)  # clean memory
+            with open(fnamepos, 'wb') as f:  # touch file
+                f.write(empty)
+
         self.fpos = open(fnamepos, 'r+b')
 
         self.fread = None
@@ -181,7 +185,7 @@ class FileQueue(object):
                     # New, perhaps empty or corrupt pos file
                     frnum, offset = self._update_pos()
                     age = 0
-                # self.log.debug('@ %s' % repr((frnum, offset, age)))
+                # self.log.debug('%s @ %s' % (self.name, repr((frnum, offset, age))))
 
                 # Open proper queue file for reading (if it isn't open yet):
                 self._open_read(frnum)
@@ -189,7 +193,16 @@ class FileQueue(object):
 
                 # Read from the queue
                 try:
-                    value = marshal.load(self.fread)
+                    crc32, value = marshal.load(self.fread)
+                    if crc32 != zlib.crc32(value):
+                        raise ValueError
+                except EOFError:
+                    pass  # The file could not be read, ignore
+                except (ValueError, TypeError):
+                    # New, perhaps empty or corrupt pos file (since the position offset has an invalid marshal)
+                    frnum, offset = self._update_pos()
+                    age = 0
+                else:
                     offset = self.fread.tell()
                     if offset > self.bucket_size:
                         self._cleanup(frnum - 1)
@@ -201,9 +214,7 @@ class FileQueue(object):
                         # If there's something more to read in the file,
                         # release (or re-release) the semaphore.
                         self.sem.release()
-                    return value
-                except (EOFError, ValueError, TypeError):
-                    pass  # The file could not be read, ignore
+                    break
                 finally:
                     # Update position
                     if age >= self.sync_age:
@@ -214,16 +225,20 @@ class FileQueue(object):
             finally:
                 self.lock.release()
 
+        return value and marshal.loads(zlib.decompress(value))
+
     def put(self, value, block=True, timeout=None):
+        value = zlib.compress(marshal.dumps(value))
+        crc32 = zlib.crc32(value)
         with flock(self.fwrite) as fwrite:
-            marshal.dump(value, fwrite)
+            marshal.dump((crc32, value), fwrite)
             fwrite.flush()
             os.fsync(fwrite.fileno())
             offset = fwrite.tell()
+        self.sem.release()
         if offset > self.bucket_size:
             # Switch to a new queue file:
             self._open_write(self.fwnum + 1)
-        self.sem.release()
 
 
 # def main(argv):
